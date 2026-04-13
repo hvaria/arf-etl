@@ -1,0 +1,26 @@
+{
+  "name": "arf-etl",
+  "version": "1.0.0",
+  "description": "Standalone ETL service for ARF Map — fetches CCLD facility data and writes to SQLite",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "etl":    "tsx src/etl.ts",
+    "enrich": "tsx src/enrich-facilities.ts",
+    "seed":   "tsx src/seed-facilities-db.ts",
+    "extract": "tsx src/extract-ccld-data.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^17.4.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "20.19.27",
+    "tsx": "^4.20.5",
+    "typescript": "5.6.3"
+  }
+}
