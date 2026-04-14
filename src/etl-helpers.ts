@@ -187,123 +187,196 @@ function normalizeDate(raw: string): string {
   return raw;
 }
 
-function parseMostRecentVisitDate(data: unknown): string | null {
-  const records: any[] = Array.isArray(data)
-    ? data
-    : ((data as any)?.records ?? (data as any)?.value ?? []);
-
-  let latestMs = 0;
-  let latestNorm = "";
-
-  for (const r of records) {
-    const raw: string =
-      r.visitDate ?? r.VisitDate ?? r.visit_date ?? r.VisitDt ?? r.visitdt ?? "";
-    if (!raw) continue;
-    const ms = new Date(raw).getTime();
-    if (!isNaN(ms) && ms > latestMs) {
-      latestMs = ms;
-      latestNorm = normalizeDate(raw);
-    }
-  }
-
-  return latestNorm || null;
-}
-
-export function parseEvaluationReport(html: string): FacilityEnrichmentData {
-  const text = html
+function stripHtml(html: string): string {
+  return html
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
     .replace(/\s{2,}/g, " ");
+}
 
+/**
+ * Attempt to extract plain text from a PDF buffer using pdf-parse.
+ * Returns empty string if pdf-parse is unavailable or parsing fails.
+ */
+async function parsePdfBuffer(buffer: ArrayBuffer): Promise<string> {
+  try {
+    // Dynamic import so the rest of the pipeline works even if pdf-parse is absent
+    const pdfParse = await import("pdf-parse");
+    const fn = (pdfParse as any).default ?? pdfParse;
+    const data = await fn(Buffer.from(buffer));
+    return (data as any).text ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Parse a CCLD Facility Evaluation Report (HTML or pre-extracted PDF text).
+ *
+ * Key field locations in the stripped text:
+ *   DATE: MM/DD/YYYY           — visit date (appears in form header AND deficiency pages)
+ *   ADMINISTRATOR: LAST, FIRST — or ADMINISTRATOR/ DIRECTOR: ...
+ *   LICENSEE: ...              — may not appear in evaluation reports (comes from CHHS data)
+ *   Type B ... Section Cited   — each Type-B deficiency block
+ *   Type A ... Section Cited   — each Type-A deficiency block (civil penalty trigger)
+ */
+export function parseEvaluationReport(html: string): FacilityEnrichmentData {
+  const text = stripHtml(html);
   const result: FacilityEnrichmentData = {};
 
-  const dateM = text.match(
-    /VISIT\s+DATE\s*[:\s]+(\d{1,2}\/\d{1,2}\/\d{4}|\d{4}-\d{2}-\d{2})/i,
-  );
+  // ── Visit date ─────────────────────────────────────────────────────────────
+  // "DATE: MM/DD/YYYY" matches "Report Date: 04/14/2022" and "DATE: 04/14/2022"
+  // Does NOT match "Date Signed: ..." (colon is after "Signed", not after "Date")
+  const dateM =
+    text.match(/\bDATE\s*:\s*(\d{1,2}\/\d{1,2}\/\d{4})/i) ??
+    text.match(/(?:VISIT\s+DATE|INSPECTION\s+DATE|DATE\s+OF\s+VISIT)\s*[:\s]+(\d{1,2}\/\d{1,2}\/\d{4})/i) ??
+    text.match(/\b(\d{1,2}\/\d{1,2}\/\d{4})\b/);
   if (dateM) result.last_inspection_date = normalizeDate(dateM[1]);
 
+  // ── Administrator ──────────────────────────────────────────────────────────
+  // Patterns seen in the wild:
+  //   ADMINISTRATOR: LASTNAME, FIRSTNAME
+  //   ADMINISTRATOR/ DIRECTOR: LASTNAME, FIRSTNAME
+  //   ADMINISTRATOR: ADMINISTRATOR/ DIRECTOR: LASTNAME, FIRSTNAME  (duplicate artifact)
+  const ADMIN_STOP =
+    "PHONE|FAX|LICENSE|CAPACITY|LICENSEE|COUNTY|CITY|ADDRESS|" +
+    "FACILITY\\s+TYPE|TYPE\\s*:|TELEPHONE|DATE\\s*:";
   const adminM = text.match(
-    /ADMINISTRATOR(?:\s*\/\s*DIRECTOR)?\s*[:\s]+([A-Za-z][A-Za-z\s,.'"\-]{1,60}?)(?=\s{2,}|PHONE|FAX|LICENSE|CAPACITY|LICENSEE|VISIT|COUNTY|CITY|ADDRESS|$)/i,
+    new RegExp(
+      "ADMINISTRATOR(?:\\s*\\/\\s*DIRECTOR)?\\s*[:\\s]+" +
+        "([A-Za-z][A-Za-z\\s,.'\"\\-]{1,80}?)" +
+        `(?=\\s+(?:${ADMIN_STOP})|$)`,
+      "i",
+    ),
   );
-  if (adminM) result.administrator = adminM[1].trim();
+  if (adminM) {
+    // Strip duplicated "ADMINISTRATOR[/ DIRECTOR]:" prefix that appears in some reports
+    const admin = adminM[1]
+      .trim()
+      .replace(/^ADMINISTRATOR(?:\s*\/\s*DIRECTOR)?\s*[:\s]+/i, "")
+      .trim();
+    if (admin.length >= 2) result.administrator = admin;
+  }
 
+  // ── Licensee ───────────────────────────────────────────────────────────────
+  // Not present in most evaluation reports (sourced from CHHS CCL dataset instead),
+  // but kept as a best-effort fallback for report types that do include it.
+  // Requires a colon to avoid matching "the licensee did not comply..." in narratives.
   const licenseeM = text.match(
-    /LICENSEE(?:\s*\/\s*ENTITY)?\s*[:\s]+([A-Za-z0-9][^\n]{2,80}?)(?=\s{2,}|ADMINISTRATOR|FACILITY|ADDRESS|PHONE|VISIT|$)/im,
+    /\bLICENSEE(?:\s*\/\s*ENTITY)?\s*:\s*([A-Za-z0-9][^\n]{2,80}?)(?=\s{2,}|ADMINISTRATOR|FACILITY|ADDRESS|PHONE|VISIT|$)/im,
   );
   if (licenseeM) result.licensee = licenseeM[1].trim();
 
-  const typeBM =
-    text.match(/TOTAL\s+TYPE\s*[-–]?\s*B\s+DEFICIENCIES?\s*[:\s]+(\d+)/i) ??
-    text.match(/TYPE\s*[-–]?\s*B\s+DEFICIENCIES?\s+TOTAL\s*[:\s]+(\d+)/i) ??
-    text.match(/TYPE\s*[-–]?\s*B\s+TOTAL\s*[:\s]+(\d+)/i);
-  if (typeBM) result.total_type_b = parseInt(typeBM[1], 10);
+  // ── Type-B deficiency count ────────────────────────────────────────────────
+  // Each deficiency block has the form "Type B [optional date] Section Cited [code]".
+  // The legend/explanatory text ("Type B deficiencies are violations...") does NOT
+  // contain "Section Cited", so this pattern is safe to count.
+  const typeBMatches = text.match(/\bType\s*B\b[^.]{0,80}?Section\s+Cited/gi);
+  if (typeBMatches) result.total_type_b = typeBMatches.length;
 
-  const citM =
-    text.match(/TOTAL\s+CITATIONS?\s*[:\s]+(\d+)/i) ??
-    text.match(/CITATIONS?\s+ISSUED\s*[:\s]+(\d+)/i) ??
-    text.match(/\bCITATIONS?\s*[:\s]+(\d+)/i);
-  if (citM) result.citations = parseInt(citM[1], 10);
+  // ── Citation count (Type-A deficiencies) ──────────────────────────────────
+  // Type-A deficiencies (immediate risk) trigger civil penalties / citations.
+  const typeAMatches = text.match(/\bType\s*A\b[^.]{0,80}?Section\s+Cited/gi);
+  if (typeAMatches) result.citations = typeAMatches.length;
 
   return result;
 }
 
+/**
+ * Fetch enrichment data for one facility from the CCLD Transparency API.
+ *
+ * Strategy:
+ *  1. Probe FacilityReports?facNum=X&inx=1,2,3,… until HTTP 400 (no more reports)
+ *     or a safety cap of MAX_REPORTS.
+ *  2. Extract visit date and type from each report header.
+ *  3. Filter for evaluation / annual / required-visit reports.
+ *  4. Sort by date descending — pick the most recent evaluation report.
+ *  5. Parse that report for administrator, licensee, total_type_b, citations.
+ *
+ * NOTE: The FacilityInspections endpoint returns 404 for all known facility numbers
+ * and has been removed. FacilityReports is the sole reliable data source.
+ */
 export async function fetchFacilityEnrichment(
   facNum: string,
   throttle: () => Promise<void>,
 ): Promise<FacilityEnrichmentData> {
-  const result: FacilityEnrichmentData = {};
+  const MAX_REPORTS = 20;
 
-  try {
-    await throttle();
-    const res = await fetch(
-      `${CCLD_BASE}/FacilityInspections?facNum=${encodeURIComponent(facNum)}`,
-      { headers: { Accept: "application/json" } },
-    );
-    if (res.ok) {
-      const ct   = res.headers.get("content-type") ?? "";
-      const body = await res.text();
-      const looksJson =
-        ct.includes("json") ||
-        body.trimStart().startsWith("[") ||
-        body.trimStart().startsWith("{");
-      if (looksJson) {
-        try {
-          const date = parseMostRecentVisitDate(JSON.parse(body));
-          if (date) result.last_inspection_date = date;
-        } catch {}
-      }
-    }
-  } catch {}
-
-  for (const inx of [1, 4]) {
-    try {
-      await throttle();
-      const res = await fetch(
-        `${CCLD_BASE}/FacilityReports?facNum=${encodeURIComponent(facNum)}&inx=${inx}`,
-      );
-      if (!res.ok) continue;
-
-      const html = await res.text();
-      if (html.trim().length < 200) continue;
-
-      const parsed = parseEvaluationReport(html);
-
-      if (!result.last_inspection_date && parsed.last_inspection_date)
-        result.last_inspection_date = parsed.last_inspection_date;
-
-      if (parsed.administrator) result.administrator = parsed.administrator;
-      if (parsed.licensee)      result.licensee      = parsed.licensee;
-      if (parsed.total_type_b !== undefined) result.total_type_b = parsed.total_type_b;
-      if (parsed.citations     !== undefined) result.citations    = parsed.citations;
-
-      break;
-    } catch {}
+  interface ReportMeta {
+    html:         string;   // original HTML (or PDF-extracted text)
+    date:         string;   // normalized YYYY-MM-DD extracted from header
+    isEvaluation: boolean;  // true = required/annual/evaluation visit type
   }
 
-  return result;
+  const reports: ReportMeta[] = [];
+
+  for (let inx = 1; inx <= MAX_REPORTS; inx++) {
+    await throttle();
+
+    let res: Response;
+    try {
+      res = await fetch(
+        `${CCLD_BASE}/FacilityReports?facNum=${encodeURIComponent(facNum)}&inx=${inx}`,
+      );
+    } catch {
+      break;
+    }
+
+    // 400 = no report at this index (past the end of the list)
+    // 404 = unknown facility
+    if (res.status === 400 || res.status === 404) break;
+    if (!res.ok) continue;
+
+    const ct = res.headers.get("content-type") ?? "";
+    let reportHtml: string;
+
+    if (ct.includes("pdf")) {
+      // Some older reports are served as PDFs; extract text and treat as plain text
+      const pdfText = await parsePdfBuffer(await res.arrayBuffer());
+      if (!pdfText.trim()) continue;
+      reportHtml = pdfText;   // parseEvaluationReport handles pre-stripped text safely
+    } else {
+      reportHtml = await res.text();
+      if (reportHtml.trim().length < 200) continue;
+    }
+
+    // Quick header scan (stripped text) for date + visit type
+    const preview = stripHtml(reportHtml);
+
+    // "DATE: MM/DD/YYYY" — matches "Report Date:" and the form "DATE:" field.
+    // Capped to the first 1 500 chars where the form header always appears.
+    const dateM = preview.slice(0, 1500).match(/\bDATE\s*:\s*(\d{1,2}\/\d{1,2}\/\d{4})/i);
+    const date  = dateM ? normalizeDate(dateM[1]) : "";
+
+    // Evaluation visits include "Required - N Year", "Annual", and "Comprehensive Inspection"
+    const isEvaluation = /required\s*[-–]?\s*\d+\s*year|annual\b|comprehensive\s+inspection/i
+      .test(preview.slice(0, 1500));
+
+    reports.push({ html: reportHtml, date, isEvaluation });
+  }
+
+  if (reports.length === 0) return {};
+
+  // Prefer evaluation/annual reports; fall back to all reports if none found
+  const pool = reports.some(r => r.isEvaluation)
+    ? reports.filter(r => r.isEvaluation)
+    : reports;
+
+  // Sort by date descending — most recent first
+  pool.sort((a, b) => b.date.localeCompare(a.date));
+  const best = pool[0];
+
+  const parsed = parseEvaluationReport(best.html);
+
+  // Use the header-extracted date as fallback if the report parser couldn't find one
+  if (!parsed.last_inspection_date && best.date) {
+    parsed.last_inspection_date = best.date;
+  }
+
+  return parsed;
 }
 
 export function rateLimiter(requestsPerSecond: number): () => Promise<void> {
